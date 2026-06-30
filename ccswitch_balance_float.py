@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 import json
+import math
 import os
 import re
 import socket
@@ -35,11 +36,32 @@ SETTINGS_JSON_PATH = USER_HOME / ".cc-switch" / "settings.json"
 CONFIG_DIR = ROAMING_APPDATA / "CCSwitchBalanceFloat"
 CONFIG_PATH = CONFIG_DIR / "settings.json"
 
-WINDOW_WIDTH = 100
+WINDOW_WIDTH = 110
 WINDOW_HEIGHT = 30
 PROVIDER_NAME_MAX_CHARS = 6
 POLL_SECONDS = 2.0
 DEFAULT_QUERY_SECONDS = 30
+AUTO_REFRESH_CONFIG_KEY = "auto_refresh_seconds"
+AUTO_REFRESH_PROVIDER = "provider"
+AUTO_REFRESH_NEVER = "never"
+AUTO_REFRESH_OPTIONS = (
+    ("Provider default", AUTO_REFRESH_PROVIDER, None),
+    ("1 minute", "60", 60),
+    ("3 minutes", "180", 180),
+    ("10 minutes", "600", 600),
+    ("Never auto refresh", AUTO_REFRESH_NEVER, None),
+)
+NORMAL_ALPHA = 0.96
+PRESSED_ALPHA = 0.88
+ANIMATION_FRAME_MS = 16
+ENTER_DURATION_MS = 240
+ENTER_START_SCALE = 0.85
+PRESS_DURATION_MS = 90
+RELEASE_DURATION_MS = 140
+SNAP_DURATION_MS = 180
+SUCCESS_FLASH_MS = 220
+PULSE_SECONDS = 1.2
+DRAG_THRESHOLD = 4
 TRANSPARENT = "#010203"
 
 
@@ -76,6 +98,82 @@ def load_config() -> dict[str, Any]:
 def save_config(data: dict[str, Any]) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def lerp(start: float, end: float, progress: float) -> float:
+    return start + (end - start) * progress
+
+
+def ease_out_cubic(progress: float) -> float:
+    progress = clamp(progress, 0.0, 1.0)
+    return 1 - (1 - progress) ** 3
+
+
+def ease_out_back(progress: float) -> float:
+    progress = clamp(progress, 0.0, 1.0)
+    c1 = 1.70158
+    c3 = c1 + 1
+    return 1 + c3 * (progress - 1) ** 3 + c1 * (progress - 1) ** 2
+
+
+def smoothstep(progress: float) -> float:
+    progress = clamp(progress, 0.0, 1.0)
+    return progress * progress * (3 - 2 * progress)
+
+
+def blend_color(start: str, end: str, progress: float) -> str:
+    progress = clamp(progress, 0.0, 1.0)
+    start = start.lstrip("#")
+    end = end.lstrip("#")
+    channels = []
+    for index in range(0, 6, 2):
+        start_value = int(start[index : index + 2], 16)
+        end_value = int(end[index : index + 2], 16)
+        channels.append(round(lerp(start_value, end_value, progress)))
+    return f"#{channels[0]:02x}{channels[1]:02x}{channels[2]:02x}"
+
+
+def windows_allows_animation() -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        enabled = wintypes.BOOL()
+        if user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(enabled), 0):
+            return bool(enabled.value)
+    except Exception:
+        pass
+    return True
+
+
+def animations_enabled(config: dict[str, Any]) -> bool:
+    reduce_motion = config.get("reduce_motion")
+    if isinstance(reduce_motion, bool):
+        return not reduce_motion
+    return windows_allows_animation()
+
+
+def auto_refresh_mode(config: dict[str, Any]) -> str:
+    if AUTO_REFRESH_CONFIG_KEY not in config:
+        return AUTO_REFRESH_PROVIDER
+
+    value = config.get(AUTO_REFRESH_CONFIG_KEY)
+    if value == AUTO_REFRESH_PROVIDER:
+        return AUTO_REFRESH_PROVIDER
+    if value is None:
+        return AUTO_REFRESH_NEVER
+
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return AUTO_REFRESH_PROVIDER
+
+    valid_seconds = {seconds_value for _, _, seconds_value in AUTO_REFRESH_OPTIONS if seconds_value is not None}
+    return str(seconds) if seconds in valid_seconds else AUTO_REFRESH_PROVIDER
 
 
 def cc_switch_exe_candidates() -> list[Path]:
@@ -232,6 +330,13 @@ def usage_interval(usage_script: dict[str, Any]) -> int:
         return max(5, min(interval, 3600))
     except Exception:
         return DEFAULT_QUERY_SECONDS
+
+
+def get_provider_interval(provider: ProviderConfig) -> int:
+    usage_script = provider.meta.get("usage_script")
+    if not isinstance(usage_script, dict):
+        return DEFAULT_QUERY_SECONDS
+    return usage_interval(usage_script)
 
 
 def build_request(provider: ProviderConfig) -> tuple[str, str, dict[str, str], bytes | None, int]:
@@ -452,11 +557,14 @@ def rounded_rect(canvas: tk.Canvas, x1: int, y1: int, x2: int, y2: int, radius: 
 
 class BalanceWindow:
     def __init__(self) -> None:
+        self.config = load_config()
+        self.motion_enabled = animations_enabled(self.config)
+
         self.root = tk.Tk()
         self.root.title(APP_NAME)
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.96)
+        self.root.attributes("-alpha", 0.0 if self.motion_enabled else NORMAL_ALPHA)
         self.root.configure(bg=TRANSPARENT)
         try:
             self.root.attributes("-transparentcolor", TRANSPARENT)
@@ -476,6 +584,7 @@ class BalanceWindow:
         self.title_font = tkfont.Font(family="Segoe UI", size=10, weight="bold")
         self.value_font = tkfont.Font(family="Segoe UI", size=10, weight="bold")
         self.status_font = tkfont.Font(family="Segoe UI", size=8)
+        self.font_cache: dict[int, tkfont.Font] = {}
 
         self.provider_id = ""
         self.provider_name = "CC Switch"
@@ -485,14 +594,32 @@ class BalanceWindow:
         self.ok = False
         self.next_query_at = 0.0
         self.query_interval = DEFAULT_QUERY_SECONDS
+        self.auto_refresh_mode = auto_refresh_mode(self.config)
+        self.auto_refresh_var = tk.StringVar(value=self.auto_refresh_mode)
         self.worker_running = False
         self.querying = False
         self.stop_event = threading.Event()
         self.drag_start: tuple[int, int, int, int] | None = None
         self.drag_moved = False
+        self.real_x = 0
+        self.real_y = 0
+        self.visual_scale = ENTER_START_SCALE if self.motion_enabled else 1.0
+        self.window_alpha = 0.0 if self.motion_enabled else NORMAL_ALPHA
+        self.flash_progress = 0.0
+        self.animation_tokens: dict[str, int] = {}
+        self.pulse_after_id: str | None = None
 
         self.menu = tk.Menu(self.root, tearoff=False)
         self.menu.add_command(label="Refresh now", command=self.force_refresh)
+        self.auto_refresh_menu = tk.Menu(self.menu, tearoff=False)
+        for label, value, _seconds in AUTO_REFRESH_OPTIONS:
+            self.auto_refresh_menu.add_radiobutton(
+                label=label,
+                value=value,
+                variable=self.auto_refresh_var,
+                command=self.apply_auto_refresh_selection,
+            )
+        self.menu.add_cascade(label="Auto refresh", menu=self.auto_refresh_menu)
         self.menu.add_command(label="Open CC Switch", command=focus_or_start_ccswitch)
         self.menu.add_separator()
         self.menu.add_command(label="Exit", command=self.quit)
@@ -500,17 +627,144 @@ class BalanceWindow:
         self.place_window()
         self.bind_events()
         self.draw()
+        self.start_enter_animation()
         self.root.after(100, self.tick)
 
     def place_window(self) -> None:
-        config = load_config()
-        x = config.get("x")
-        y = config.get("y")
+        x = self.config.get("x")
+        y = self.config.get("y")
         if not isinstance(x, int) or not isinstance(y, int):
             screen_w = self.root.winfo_screenwidth()
             x = max(10, screen_w - WINDOW_WIDTH - 24)
             y = 90
-        self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}+{x}+{y}")
+        x, y = self.clamp_position(x, y)
+        self.set_position(x, y)
+
+    def set_position(self, x: float, y: float) -> None:
+        self.real_x = int(round(x))
+        self.real_y = int(round(y))
+        self.apply_window_geometry()
+
+    def scaled_size(self) -> tuple[int, int]:
+        scale = clamp(self.visual_scale, 0.7, 1.15)
+        return max(1, round(WINDOW_WIDTH * scale)), max(1, round(WINDOW_HEIGHT * scale))
+
+    def apply_window_geometry(self) -> None:
+        width, height = self.scaled_size()
+        visual_x = round(self.real_x + (WINDOW_WIDTH - width) / 2)
+        visual_y = round(self.real_y + (WINDOW_HEIGHT - height) / 2)
+        self.root.geometry(f"{width}x{height}+{visual_x}+{visual_y}")
+        self.canvas.configure(width=width, height=height)
+
+    def clamp_position(self, x: float, y: float) -> tuple[int, int]:
+        max_x = max(0, self.root.winfo_screenwidth() - WINDOW_WIDTH)
+        max_y = max(0, self.root.winfo_screenheight() - WINDOW_HEIGHT)
+        return int(round(clamp(x, 0, max_x))), int(round(clamp(y, 0, max_y)))
+
+    def save_position(self) -> None:
+        config = load_config()
+        config["x"] = self.real_x
+        config["y"] = self.real_y
+        save_config(config)
+
+    def apply_auto_refresh_selection(self) -> None:
+        mode = self.auto_refresh_var.get()
+        self.auto_refresh_mode = mode
+        config = load_config()
+        if mode == AUTO_REFRESH_PROVIDER:
+            config.pop(AUTO_REFRESH_CONFIG_KEY, None)
+        elif mode == AUTO_REFRESH_NEVER:
+            config[AUTO_REFRESH_CONFIG_KEY] = None
+        else:
+            try:
+                config[AUTO_REFRESH_CONFIG_KEY] = int(mode)
+            except ValueError:
+                config.pop(AUTO_REFRESH_CONFIG_KEY, None)
+                self.auto_refresh_mode = AUTO_REFRESH_PROVIDER
+                self.auto_refresh_var.set(AUTO_REFRESH_PROVIDER)
+        save_config(config)
+
+        self.query_interval = self.current_query_interval(self.query_interval)
+        self.next_query_at = float("inf") if self.query_interval <= 0 else time.time() + self.query_interval
+
+    def current_query_interval(self, provider_interval: int) -> int:
+        mode = self.auto_refresh_mode
+        if mode == AUTO_REFRESH_NEVER:
+            return 0
+        if mode == AUTO_REFRESH_PROVIDER:
+            return provider_interval
+        try:
+            return max(1, int(mode))
+        except ValueError:
+            return provider_interval
+
+    def set_window_alpha(self, alpha: float) -> None:
+        self.window_alpha = clamp(alpha, 0.0, NORMAL_ALPHA)
+        try:
+            self.root.attributes("-alpha", self.window_alpha)
+        except tk.TclError:
+            pass
+
+    def animate(
+        self,
+        name: str,
+        duration_ms: int,
+        update: Any,
+        easing: Any = ease_out_cubic,
+        done: Any | None = None,
+    ) -> None:
+        self.animation_tokens[name] = self.animation_tokens.get(name, 0) + 1
+        token = self.animation_tokens[name]
+
+        if not self.motion_enabled or duration_ms <= 0:
+            update(1.0)
+            if done:
+                done()
+            return
+
+        started_at = time.monotonic()
+
+        def step() -> None:
+            if self.stop_event.is_set() or self.animation_tokens.get(name) != token:
+                return
+
+            raw_progress = ((time.monotonic() - started_at) * 1000) / duration_ms
+            progress = easing(raw_progress)
+            update(progress)
+
+            if raw_progress >= 1:
+                update(easing(1.0))
+                if done:
+                    done()
+                return
+
+            self.root.after(ANIMATION_FRAME_MS, step)
+
+        step()
+
+    def cancel_animation(self, name: str) -> None:
+        self.animation_tokens[name] = self.animation_tokens.get(name, 0) + 1
+
+    def animate_visual_to(self, scale: float, alpha: float, duration_ms: int, easing: Any = ease_out_cubic) -> None:
+        start_scale = self.visual_scale
+        start_alpha = self.window_alpha
+
+        def update(progress: float) -> None:
+            self.visual_scale = lerp(start_scale, scale, progress)
+            self.apply_window_geometry()
+            self.set_window_alpha(lerp(start_alpha, alpha, progress))
+            self.draw()
+
+        self.animate("visual", duration_ms, update, easing)
+
+    def start_enter_animation(self) -> None:
+        if not self.motion_enabled:
+            self.visual_scale = 1.0
+            self.set_window_alpha(NORMAL_ALPHA)
+            self.draw()
+            return
+
+        self.animate_visual_to(1.0, NORMAL_ALPHA, ENTER_DURATION_MS, ease_out_back)
 
     def bind_events(self) -> None:
         self.canvas.bind("<ButtonPress-1>", self.on_press)
@@ -522,8 +776,10 @@ class BalanceWindow:
         self.menu.tk_popup(event.x_root, event.y_root)
 
     def on_press(self, event: tk.Event) -> None:
-        self.drag_start = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
+        self.cancel_animation("position")
+        self.drag_start = (event.x_root, event.y_root, self.real_x, self.real_y)
         self.drag_moved = False
+        self.animate_visual_to(0.94, PRESSED_ALPHA, PRESS_DURATION_MS, smoothstep)
 
     def on_drag(self, event: tk.Event) -> None:
         if self.drag_start is None:
@@ -531,19 +787,77 @@ class BalanceWindow:
         start_x, start_y, win_x, win_y = self.drag_start
         dx = event.x_root - start_x
         dy = event.y_root - start_y
-        if abs(dx) + abs(dy) > 4:
+        if abs(dx) + abs(dy) > DRAG_THRESHOLD and not self.drag_moved:
             self.drag_moved = True
-        self.root.geometry(f"+{win_x + dx}+{win_y + dy}")
+            self.animate_visual_to(1.0, NORMAL_ALPHA, RELEASE_DURATION_MS, ease_out_cubic)
+        self.set_position(win_x + dx, win_y + dy)
 
     def on_release(self, event: tk.Event) -> None:
         if self.drag_moved:
-            config = load_config()
-            config["x"] = self.root.winfo_x()
-            config["y"] = self.root.winfo_y()
-            save_config(config)
+            self.animate_visual_to(1.0, NORMAL_ALPHA, RELEASE_DURATION_MS, ease_out_cubic)
+            self.snap_to_edge()
         else:
+            self.animate_visual_to(1.0, NORMAL_ALPHA, RELEASE_DURATION_MS, ease_out_back)
             self.force_refresh()
         self.drag_start = None
+
+    def snap_to_edge(self) -> None:
+        current_x, current_y = self.clamp_position(self.real_x, self.real_y)
+        screen_w = self.root.winfo_screenwidth()
+        target_x = 0 if current_x + WINDOW_WIDTH / 2 < screen_w / 2 else screen_w - WINDOW_WIDTH
+        target_x, target_y = self.clamp_position(target_x, current_y)
+
+        if not self.motion_enabled:
+            self.set_position(target_x, target_y)
+            self.save_position()
+            return
+
+        start_x = self.real_x
+        start_y = self.real_y
+
+        def update(progress: float) -> None:
+            self.set_position(lerp(start_x, target_x, progress), lerp(start_y, target_y, progress))
+
+        self.animate("position", SNAP_DURATION_MS, update, ease_out_cubic, self.save_position)
+
+    def scaled_font(self, base_size: int) -> tkfont.Font:
+        size = max(6, round(base_size * clamp(self.visual_scale, 0.7, 1.15)))
+        font = self.font_cache.get(size)
+        if font is None:
+            font = tkfont.Font(family="Segoe UI", size=size, weight="bold")
+            self.font_cache[size] = font
+        return font
+
+    def start_query_pulse(self) -> None:
+        if not self.motion_enabled or self.pulse_after_id is not None:
+            return
+
+        def pulse() -> None:
+            self.pulse_after_id = None
+            if self.stop_event.is_set() or not self.querying:
+                return
+            self.draw()
+            self.pulse_after_id = self.root.after(ANIMATION_FRAME_MS, pulse)
+
+        self.pulse_after_id = self.root.after(ANIMATION_FRAME_MS, pulse)
+
+    def stop_query_pulse(self) -> None:
+        if self.pulse_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self.pulse_after_id)
+        except tk.TclError:
+            pass
+        self.pulse_after_id = None
+
+    def start_success_flash(self) -> None:
+        self.flash_progress = 1.0
+
+        def update(progress: float) -> None:
+            self.flash_progress = 1.0 - progress
+            self.draw()
+
+        self.animate("flash", SUCCESS_FLASH_MS, update, ease_out_cubic)
 
     def truncate_to_width(self, text: str, max_width: int, font: tkfont.Font) -> str:
         if font.measure(text) <= max_width:
@@ -555,20 +869,51 @@ class BalanceWindow:
 
     def draw(self) -> None:
         self.canvas.delete("all")
+        width, height = self.scaled_size()
+        scale_x = width / WINDOW_WIDTH
+        scale_y = height / WINDOW_HEIGHT
+        scale = min(scale_x, scale_y)
+
+        def sx(value: float) -> int:
+            return round(value * scale_x)
+
+        def sy(value: float) -> int:
+            return round(value * scale_y)
+
+        base_outline = "#2f80ed" if self.ok else "#3a3d45"
+        outline = blend_color(base_outline, "#9dccff", self.flash_progress)
         rounded_rect(
             self.canvas,
-            1,
-            1,
-            WINDOW_WIDTH - 1,
-            WINDOW_HEIGHT - 1,
-            16,
+            sx(1),
+            sy(1),
+            width - sx(1),
+            height - sy(1),
+            max(8, sx(16)),
             fill="#202226",
-            outline="#2f80ed" if self.ok else "#3a3d45",
-            width=1,
+            outline=outline,
+            width=max(1, round(scale)),
         )
 
         dot_color = "#22c55e" if self.ok else "#f59e0b"
-        self.canvas.create_oval(10, 11, 18, 19, fill=dot_color, outline="")
+        dot_scale = 1.0
+        if self.querying and self.motion_enabled:
+            wave = (math.sin((time.monotonic() * math.tau) / PULSE_SECONDS) + 1) / 2
+            pulse = smoothstep(wave)
+            dot_scale = 1.0 + 0.08 * pulse
+            dot_color = blend_color(dot_color, "#d7fbe8" if self.ok else "#fde68a", 0.28 * pulse)
+        dot_radius = max(3, round(4 * scale * dot_scale))
+        dot_x = sx(14)
+        dot_y = sy(15)
+        self.canvas.create_oval(
+            dot_x - dot_radius,
+            dot_y - dot_radius,
+            dot_x + dot_radius,
+            dot_y + dot_radius,
+            fill=dot_color,
+            outline="",
+        )
+
+        value_font = self.scaled_font(10)
 
         if self.querying:
             display_text = "Updating..."
@@ -576,52 +921,57 @@ class BalanceWindow:
         elif self.amount:
             name_text = compact_provider_name(self.provider_name)
             value_text = format_balance_value(self.amount, self.unit)
-            value_width = self.value_font.measure(value_text)
-            name_width = max(8, WINDOW_WIDTH - 34 - value_width - 8)
-            name_text = self.truncate_to_width(name_text, name_width, self.value_font)
+            value_width = value_font.measure(value_text)
+            name_x = sx(24)
+            value_x = width - sx(10)
+            name_width = max(sx(8), value_x - name_x - value_width - sx(8))
+            name_text = self.truncate_to_width(name_text, name_width, value_font)
             self.canvas.create_text(
-                24,
-                WINDOW_HEIGHT // 2,
+                name_x,
+                height // 2,
                 anchor="w",
                 text=name_text,
                 fill="#f4f7fb",
-                font=self.value_font,
+                font=value_font,
             )
             self.canvas.create_text(
-                WINDOW_WIDTH - 10,
-                WINDOW_HEIGHT // 2,
+                value_x,
+                height // 2,
                 anchor="e",
                 text=value_text,
                 fill="#f4f7fb",
-                font=self.value_font,
+                font=value_font,
             )
             return
         else:
             display_text = f"{compact_provider_name(self.provider_name)} {self.status}"
             text_color = "#c4c8d0"
 
-        display_text = self.truncate_to_width(display_text, WINDOW_WIDTH - 34, self.value_font)
+        display_text = self.truncate_to_width(display_text, width - sx(34), value_font)
         self.canvas.create_text(
-            24,
-            WINDOW_HEIGHT // 2,
+            sx(24),
+            height // 2,
             anchor="w",
             text=display_text,
             fill=text_color,
-            font=self.value_font,
+            font=value_font,
         )
 
     def apply_result(self, result: BalanceResult) -> None:
+        self.stop_query_pulse()
         self.provider_id = result.provider_id
         self.provider_name = result.provider_name
         self.amount = result.amount
         self.unit = result.unit
         self.status = result.status
-        self.query_interval = result.interval_seconds
-        self.next_query_at = time.time() + self.query_interval
+        self.query_interval = self.current_query_interval(result.interval_seconds)
+        self.next_query_at = float("inf") if self.query_interval <= 0 else time.time() + self.query_interval
         self.ok = result.ok
         self.worker_running = False
         self.querying = False
         self.draw()
+        if result.ok:
+            self.start_success_flash()
 
     def apply_provider_waiting(self, provider: ProviderConfig, status: str) -> None:
         self.provider_id = provider.provider_id
@@ -647,36 +997,55 @@ class BalanceWindow:
         if not self.worker_running:
             self.worker_running = True
             if force:
-                self.querying = True
-                self.draw()
+                self.mark_querying()
             threading.Thread(target=self.refresh_worker, args=(force,), daemon=True).start()
 
     def refresh_worker(self, force: bool = False) -> None:
-        provider = read_current_provider()
-        if provider is None:
-            self.root.after(0, self.apply_missing_provider)
-            return
+        try:
+            provider = read_current_provider()
+            if provider is None:
+                self.root.after(0, self.apply_missing_provider)
+                return
 
-        now = time.time()
-        provider_changed = provider.provider_id != self.provider_id
-        if provider_changed:
-            self.root.after(0, self.apply_provider_waiting, provider, "Loading...")
+            now = time.time()
+            provider_changed = provider.provider_id != self.provider_id
+            if provider_changed:
+                self.root.after(0, self.apply_provider_waiting, provider, "Loading...")
 
-        should_query = force or provider_changed or now >= self.next_query_at
-        if should_query:
-            self.root.after(0, self.mark_querying)
-            result = query_balance(provider)
-            self.root.after(0, self.apply_result, result)
-        else:
-            self.worker_running = False
-            self.querying = False
-            self.root.after(0, self.draw)
+            auto_refresh_enabled = self.current_query_interval(get_provider_interval(provider)) > 0
+            should_query = force or provider_changed or (auto_refresh_enabled and now >= self.next_query_at)
+            if should_query:
+                self.root.after(0, self.mark_querying)
+                result = query_balance(provider)
+                self.root.after(0, self.apply_result, result)
+            else:
+                self.root.after(0, self.apply_idle)
+        except Exception as exc:
+            self.root.after(0, self.apply_worker_error, type(exc).__name__)
+
+    def apply_idle(self) -> None:
+        self.worker_running = False
+        self.querying = False
+        self.stop_query_pulse()
+        self.draw()
+
+    def apply_worker_error(self, status: str) -> None:
+        self.amount = None
+        self.status = status
+        self.ok = False
+        self.worker_running = False
+        self.querying = False
+        self.stop_query_pulse()
+        self.draw()
 
     def mark_querying(self) -> None:
         self.querying = True
+        self.start_query_pulse()
         self.draw()
 
     def apply_missing_provider(self) -> None:
+        self.stop_query_pulse()
+        self.flash_progress = 0.0
         self.provider_id = ""
         self.provider_name = "CC Switch"
         self.amount = None
@@ -689,6 +1058,7 @@ class BalanceWindow:
 
     def quit(self) -> None:
         self.stop_event.set()
+        self.stop_query_pulse()
         self.root.destroy()
 
     def run(self) -> None:
