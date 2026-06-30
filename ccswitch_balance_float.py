@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 import json
 import os
 import re
@@ -23,6 +24,7 @@ from tkinter import font as tkfont
 
 APP_NAME = "CCSwitch Balance Float"
 MUTEX_NAME = "Local\\CCSwitchBalanceFloat"
+MUTEX_HANDLE = None
 USER_HOME = Path(os.environ.get("USERPROFILE") or Path.home())
 LOCAL_APPDATA = Path(os.environ.get("LOCALAPPDATA") or (USER_HOME / "AppData" / "Local"))
 ROAMING_APPDATA = Path(os.environ.get("APPDATA") or (USER_HOME / "AppData" / "Roaming"))
@@ -33,9 +35,9 @@ SETTINGS_JSON_PATH = USER_HOME / ".cc-switch" / "settings.json"
 CONFIG_DIR = ROAMING_APPDATA / "CCSwitchBalanceFloat"
 CONFIG_PATH = CONFIG_DIR / "settings.json"
 
-WINDOW_WIDTH = 260
-WINDOW_HEIGHT = 62
-REFRESH_BUTTON = (180, 34, 246, 54)
+WINDOW_WIDTH = 100
+WINDOW_HEIGHT = 30
+PROVIDER_NAME_MAX_CHARS = 6
 POLL_SECONDS = 2.0
 DEFAULT_QUERY_SECONDS = 30
 TRANSPARENT = "#010203"
@@ -325,6 +327,22 @@ def format_amount(amount: Decimal) -> str:
     return f"{rounded:,.2f}"
 
 
+def compact_provider_name(name: str) -> str:
+    name = name.strip() or "CC"
+    if len(name) <= PROVIDER_NAME_MAX_CHARS:
+        return name
+    return f"{name[:PROVIDER_NAME_MAX_CHARS]}..."
+
+
+def format_balance_value(amount: str, unit: str) -> str:
+    unit = (unit or "").strip().upper()
+    if unit == "USD":
+        return f"${amount}"
+    if unit:
+        return f"{amount} {unit}"
+    return amount
+
+
 def query_balance(provider: ProviderConfig) -> BalanceResult:
     usage_script = provider.meta.get("usage_script")
     if not isinstance(usage_script, dict) or usage_script.get("enabled") is False:
@@ -472,7 +490,6 @@ class BalanceWindow:
         self.stop_event = threading.Event()
         self.drag_start: tuple[int, int, int, int] | None = None
         self.drag_moved = False
-        self.refresh_button_pressed = False
 
         self.menu = tk.Menu(self.root, tearoff=False)
         self.menu.add_command(label="Refresh now", command=self.force_refresh)
@@ -501,25 +518,14 @@ class BalanceWindow:
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<Button-3>", self.show_menu)
 
-    def is_refresh_button_hit(self, x: int, y: int) -> bool:
-        x1, y1, x2, y2 = REFRESH_BUTTON
-        return x1 <= x <= x2 and y1 <= y <= y2
-
     def show_menu(self, event: tk.Event) -> None:
         self.menu.tk_popup(event.x_root, event.y_root)
 
     def on_press(self, event: tk.Event) -> None:
-        if self.is_refresh_button_hit(event.x, event.y):
-            self.refresh_button_pressed = True
-            self.drag_start = None
-            self.draw()
-            return
         self.drag_start = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
         self.drag_moved = False
 
     def on_drag(self, event: tk.Event) -> None:
-        if self.refresh_button_pressed:
-            return
         if self.drag_start is None:
             return
         start_x, start_y, win_x, win_y = self.drag_start
@@ -530,20 +536,13 @@ class BalanceWindow:
         self.root.geometry(f"+{win_x + dx}+{win_y + dy}")
 
     def on_release(self, event: tk.Event) -> None:
-        if self.refresh_button_pressed:
-            should_refresh = self.is_refresh_button_hit(event.x, event.y)
-            self.refresh_button_pressed = False
-            self.draw()
-            if should_refresh:
-                self.force_refresh()
-            return
         if self.drag_moved:
             config = load_config()
             config["x"] = self.root.winfo_x()
             config["y"] = self.root.winfo_y()
             save_config(config)
         else:
-            focus_or_start_ccswitch()
+            self.force_refresh()
         self.drag_start = None
 
     def truncate_to_width(self, text: str, max_width: int, font: tkfont.Font) -> str:
@@ -562,67 +561,53 @@ class BalanceWindow:
             1,
             WINDOW_WIDTH - 1,
             WINDOW_HEIGHT - 1,
-            14,
+            16,
             fill="#202226",
             outline="#2f80ed" if self.ok else "#3a3d45",
             width=1,
         )
 
         dot_color = "#22c55e" if self.ok else "#f59e0b"
-        self.canvas.create_oval(16, 24, 26, 34, fill=dot_color, outline="")
+        self.canvas.create_oval(10, 11, 18, 19, fill=dot_color, outline="")
 
-        value = f"{self.amount} {self.unit}" if self.amount else self.status
-        value_color = "#22c55e" if self.ok else "#c4c8d0"
-        max_name_width = 120
-        name = self.truncate_to_width(self.provider_name, max_name_width, self.title_font)
+        if self.querying:
+            display_text = "Updating..."
+            text_color = "#c4c8d0"
+        elif self.amount:
+            name_text = compact_provider_name(self.provider_name)
+            value_text = format_balance_value(self.amount, self.unit)
+            value_width = self.value_font.measure(value_text)
+            name_width = max(8, WINDOW_WIDTH - 34 - value_width - 8)
+            name_text = self.truncate_to_width(name_text, name_width, self.value_font)
+            self.canvas.create_text(
+                24,
+                WINDOW_HEIGHT // 2,
+                anchor="w",
+                text=name_text,
+                fill="#f4f7fb",
+                font=self.value_font,
+            )
+            self.canvas.create_text(
+                WINDOW_WIDTH - 10,
+                WINDOW_HEIGHT // 2,
+                anchor="e",
+                text=value_text,
+                fill="#f4f7fb",
+                font=self.value_font,
+            )
+            return
+        else:
+            display_text = f"{compact_provider_name(self.provider_name)} {self.status}"
+            text_color = "#c4c8d0"
 
+        display_text = self.truncate_to_width(display_text, WINDOW_WIDTH - 34, self.value_font)
         self.canvas.create_text(
-            36,
-            23,
+            24,
+            WINDOW_HEIGHT // 2,
             anchor="w",
-            text=name,
-            fill="#f4f7fb",
-            font=self.title_font,
-        )
-        self.canvas.create_text(
-            WINDOW_WIDTH - 16,
-            23,
-            anchor="e",
-            text=value,
-            fill=value_color,
+            text=display_text,
+            fill=text_color,
             font=self.value_font,
-        )
-
-        hint = "Codex" if self.ok else self.status
-        x1, y1, x2, y2 = REFRESH_BUTTON
-        hint = self.truncate_to_width(hint, x1 - 46, self.status_font)
-        self.canvas.create_text(
-            36,
-            43,
-            anchor="w",
-            text=hint,
-            fill="#8a909a",
-            font=self.status_font,
-        )
-        rounded_rect(
-            self.canvas,
-            x1,
-            y1,
-            x2,
-            y2,
-            8,
-            fill="#2563eb" if self.refresh_button_pressed else "#2b3038",
-            outline="#3a83f7",
-            width=1,
-        )
-        button_label = "查询中" if self.querying else "刷新"
-        self.canvas.create_text(
-            (x1 + x2) // 2,
-            (y1 + y2) // 2,
-            anchor="center",
-            text=button_label,
-            fill="#f4f7fb",
-            font=self.status_font,
         )
 
     def apply_result(self, result: BalanceResult) -> None:
@@ -717,17 +702,20 @@ def run_once() -> int:
         return 1
     result = query_balance(provider)
     if result.amount:
-        print(f"{result.provider_name} {result.amount} {result.unit}")
+        print(f"{compact_provider_name(result.provider_name)} {format_balance_value(result.amount, result.unit)}")
         return 0
-    print(f"{result.provider_name} {result.status}")
+    print(f"{compact_provider_name(result.provider_name)} {result.status}")
     return 2
 
 
 def already_running() -> bool:
+    global MUTEX_HANDLE
     if os.name != "nt":
         return False
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    MUTEX_HANDLE = kernel32.CreateMutexW(None, True, MUTEX_NAME)
     return ctypes.get_last_error() == 183
 
 

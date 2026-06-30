@@ -4,11 +4,10 @@ A small always-on-top balance floating window for CC Switch.
 
 ## Features
 
-- Shows the current Codex provider name and balance, for example `aixj.vip 23.72 USD`
+- Shows the current Codex provider name and balance, for example `aixj.v... $23.72`
 - Stays on top
 - Drag with left mouse button; the position is saved
-- Single left click opens or focuses the CC Switch main window
-- Click the visible `刷新` button to query the balance manually
+- Single-click the capsule to query the balance manually
 - Right-click menu supports refresh, open CC Switch, and exit
 - Reads the current provider from `%USERPROFILE%\.cc-switch\cc-switch.db`
 - Stores the floating window position under `%APPDATA%\CCSwitchBalanceFloat`
@@ -21,6 +20,12 @@ A small always-on-top balance floating window for CC Switch.
 Double-click `run_ccswitch_float.bat` to start only the floating window.
 
 Double-click `start_ccswitch_with_float.bat` to start CC Switch and the floating window together.
+
+Double-click `enable_float_autostart.bat` to start the floating window now and enable Windows startup.
+
+Double-click `disable_float_autostart.bat` to close the floating window and disable Windows startup.
+
+Double-click `stop_ccswitch_float.bat` to close the floating window without changing startup.
 
 You can also run:
 
